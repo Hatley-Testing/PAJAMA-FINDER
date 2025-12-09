@@ -1,122 +1,110 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
-// On Node 18+, fetch is built-in. If you're on Node 16 or lower, tell me and we'll adjust.
+const OpenAI = require('openai');
 
 const app = express();
+const port = process.env.PORT || 3000;
+
+app.use(cors());
 app.use(express.json());
 
-// Allow your Shopify sites (you can add/remove domains later)
-app.use(cors());
-
-// Simple test route
 app.get('/', (req, res) => {
   res.send('Pajama Finder server is running');
 });
 
-// Main AI route
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
 app.post('/pajama-finder', async (req, res) => {
-  const question = req.body && req.body.question;
-  const kits = req.body && Array.isArray(req.body.kits) ? req.body.kits : null;
-
-  if (!question || !kits) {
-    return res.status(400).json({ error: 'Missing question or kits.' });
-  }
-
-  // Safety cap – we don't need more than 100 kits in prompt
-  const limitedKits = kits.slice(0, 100);
-
-  const prompt = `
-You are a shopping assistant for Little Blue House matching family pajamas.
-
-User description:
-${question}
-
-You are given a JSON array "kits". Each kit looks like:
-{
-  "handle": string,
-  "title": string,
-  "description": string,
-  "product_titles": string,
-  "url": string
-}
-
-Using ONLY this information, choose the best 2 or 3 kits for the user.
-Think about:
-- family composition (parents / kids) if mentioned
-- themes or vibes (Christmas, winter, animals, etc.)
-- climate hints (cold winter, warm, etc.)
-- any budget hints (cheap, expensive, under 150$ etc.)
-
-Return a JSON object exactly like:
-{
-  "recommendations": [
-    {
-      "handle": "kit-handle",
-      "title": "Kit Title",
-      "reason": "Short one-sentence explanation."
-    }
-  ]
-}
-
-Here is the kits JSON:
-${JSON.stringify(limitedKits)}
-`;
-
   try {
-    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4.1-mini',
-        messages: [
-          { role: 'system', content: 'You always return valid JSON only.' },
-          { role: 'user', content: prompt }
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.4
-      })
+    const { question, kits } = req.body;
+    console.log('[/pajama-finder] incoming request', {
+      question,
+      kitsCount: Array.isArray(kits) ? kits.length : 0
     });
 
-    if (!aiRes.ok) {
-      console.error('OpenAI error', aiRes.status, await aiRes.text());
-      throw new Error('AI API error');
+    if (!question || !Array.isArray(kits) || kits.length === 0) {
+      console.warn('[/pajama-finder] missing question or kits');
+      return res.status(400).json({ recommendations: [] });
     }
 
-    const json = await aiRes.json();
-    const content = json.choices?.[0]?.message?.content;
+    if (!process.env.OPENAI_API_KEY) {
+      console.error('[/pajama-finder] OPENAI_API_KEY is missing');
+      return res.status(500).json({ recommendations: [] });
+    }
+
+    // Build prompt
+    const systemPrompt = `
+You are a Shopify "Family Pajama Finder" assistant.
+The user gives you a description of their family and preferences.
+You get a list of available family pajama kits ("kits").
+Pick 1–4 kits that best match their needs.
+
+IMPORTANT:
+- Only recommend kits whose "handle" exists in the given kits list.
+- For each kit, return: handle, title, and a short reason.
+- Output MUST be valid JSON with this shape:
+
+{
+  "recommendations": [
+    { "handle": "...", "title": "...", "reason": "..." }
+  ]
+}
+    `.trim();
+
+    const kitsForModel = kits.map(k => ({
+      handle: k.handle,
+      title: k.title,
+      description: k.description || '',
+      product_titles: k.product_titles || ''
+    }));
+
+    const userPrompt =
+      `Customer description:\n${question}\n\n` +
+      `Available kits (JSON):\n` +
+      JSON.stringify(kitsForModel, null, 2) +
+      `\n\nReturn ONLY JSON in the specified format.`;
+
+    const completion = await client.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.4,
+      max_tokens: 400
+    });
+
+    const content = completion.choices[0].message.content;
+    console.log('[/pajama-finder] raw model content:', content);
 
     let parsed;
     try {
       parsed = JSON.parse(content);
     } catch (e) {
-      console.error('Failed to parse AI JSON', e, content);
-      throw new Error('Bad AI JSON');
+      console.error('[/pajama-finder] JSON parse error:', e);
+      return res.status(200).json({ recommendations: [] });
     }
 
-    if (!parsed.recommendations || !Array.isArray(parsed.recommendations)) {
-      throw new Error('No recommendations in AI JSON');
-    }
+    let recs = Array.isArray(parsed.recommendations)
+      ? parsed.recommendations
+      : [];
 
-    // Success: send the recommendations back
-    res.json(parsed);
+    // Filter out any handles not in the kits list
+    const handlesSet = new Set(kits.map(k => k.handle));
+    recs = recs.filter(r => r && handlesSet.has(r.handle));
+
+    console.log('[/pajama-finder] returning', recs.length, 'recommendations');
+    res.json({ recommendations: recs });
   } catch (err) {
-    console.error('Pajama Finder route error', err);
-
-    // Fallback: first 3 kits with generic message
-    const fallbackRecs = limitedKits.slice(0, 3).map(k => ({
-      handle: k.handle,
-      title: k.title,
-      reason: 'Popular choice from our matching family sets.'
-    }));
-
-    res.json({ recommendations: fallbackRecs });
+    console.error('[/pajama-finder] Error:', err);
+    res.status(500).json({ recommendations: [] });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('Pajama Finder server listening on port', PORT);
+app.listen(port, () => {
+  console.log(`Pajama Finder server listening on port ${port}`);
 });
